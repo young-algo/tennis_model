@@ -1,0 +1,26 @@
+{
+  "migration_id": "20250508_add_combined_surface_date_index",
+  "description": "Add combined index on surface and match_date",
+  "up": {
+    "operations": [
+      {
+        "type": "create_index",
+        "name": "idx_matches_surface_date",
+        "table": "matches",
+        "column": "surface, match_date"
+      },
+      {
+        "type": "raw_sql",
+        "sql": "ANALYZE idx_matches_surface_date;"
+      }
+    ]
+  },
+  "down": {
+    "operations": [
+      {
+        "type": "drop_index",
+        "name": "idx_matches_surface_date"
+      }
+    ]
+  }
+}
