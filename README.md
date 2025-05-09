@@ -1,0 +1,128 @@
+# Tennis Match Prediction Model
+
+A data-driven tennis match prediction model using historical ATP and WTA match data from Jeff Sackmann's repositories.
+
+## Overview
+
+This project collects and processes professional tennis match data to build predictive models for match outcomes. It includes comprehensive data ingestion, feature engineering, and machine learning pipelines.
+
+## Features
+
+- **Comprehensive Data Collection**: Ingests ATP and WTA match data from 1968 to present
+- **Rich Feature Engineering**: Player performance metrics, matchup analysis, surface specialization
+- **Extensible Architecture**: Modular design for easy enhancement and maintenance
+- **Database Migration System**: Version-controlled schema evolution
+
+## Installation
+
+### Prerequisites
+
+- Python 3.11 or higher
+- Git (for cloning data repositories)
+
+### Setup
+
+1. Clone the repository:
+```bash
+git clone https://github.com/young-algo/tennis_model.git
+cd tennis_model
+```
+
+2. Create and activate a virtual environment:
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+```
+
+3. Install dependencies:
+```bash
+pip install -e .  # Install main package
+pip install -e ".[dev]"  # Install development dependencies
+```
+
+## Usage
+
+### Data Collection
+
+Collect and process tennis match data:
+
+```bash
+python src/data/ingest_sackmann_data.py
+```
+
+Optional arguments:
+- `--reset-db`: Reset the database before ingestion
+- `--check-updates`: Check for updates in source repositories
+- `--atp-only`: Process only ATP data
+- `--wta-only`: Process only WTA data
+
+### Feature Engineering
+
+Generate features for model training:
+
+```bash
+python src/features/build_features.py
+```
+
+Optional arguments:
+- `--player-only`: Only generate player features
+- `--matchup-only`: Only generate matchup features
+- `--tournament-only`: Only generate tournament features
+
+### Database Migrations
+
+Manage database schema:
+
+```bash
+# Create a new migration
+python src/data/db_migrations.py create "Add new statistic columns"
+
+# Apply pending migrations
+python src/data/db_migrations.py apply
+
+# List migration status
+python src/data/db_migrations.py list
+
+# Revert a migration
+python src/data/db_migrations.py revert migration_20250508213000
+```
+
+## Project Structure
+
+```
+tennis_model/
+├── data/                      # Data storage
+│   ├── external/              # External data sources
+│   ├── processed/             # Processed data and features
+│   └── raw/                   # Raw data (git repositories)
+├── docs/                      # Documentation
+│   └── data_schemas.md        # Database schema documentation
+├── notebooks/                 # Jupyter notebooks for analysis
+├── src/                       # Source code
+│   ├── data/                  # Data processing modules
+│   │   ├── ingest_sackmann_data.py  # Data ingestion script
+│   │   ├── db_migrations.py   # Database migration system
+│   │   └── migrations/        # Migration files
+│   ├── features/              # Feature engineering
+│   │   └── build_features.py  # Feature building script
+│   ├── models/                # Machine learning models
+│   └── visualization/         # Visualization code
+└── tests/                     # Tests
+```
+
+## Data Sources
+
+This project uses data from the following repositories by Jeff Sackmann:
+
+- [tennis_atp](https://github.com/JeffSackmann/tennis_atp) - ATP tour match results
+- [tennis_wta](https://github.com/JeffSackmann/tennis_wta) - WTA tour match results
+- [tennis_MatchChartingProject](https://github.com/JeffSackmann/tennis_MatchChartingProject) - Detailed point-by-point data
+- [tennis_pointbypoint](https://github.com/JeffSackmann/tennis_pointbypoint) - Additional point-by-point data
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgements
+
+Special thanks to Jeff Sackmann for maintaining comprehensive tennis match datasets.
