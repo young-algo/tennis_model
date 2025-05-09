@@ -1,0 +1,19 @@
+# Core dependencies
+pandas>=1.5.0
+numpy>=1.22.0
+pyarrow>=7.0.0
+fastparquet>=0.8.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+scikit-learn>=1.0.0
+joblib>=1.1.0
+
+# Development dependencies
+pytest>=6.2.5
+flake8>=4.0.0
+black>=22.1.0
+isort>=5.10.0
+
+# Notebook dependencies
+jupyter>=1.0.0
+nbconvert>=6.4.0
