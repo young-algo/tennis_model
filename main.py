@@ -66,7 +66,7 @@ def build_features(args):
     from src.features.build_features import FeatureBuilder
     
     logger.info("Starting feature engineering process...")
-    builder = FeatureBuilder()
+    builder = FeatureBuilder(rank_cutoff=args.rank_cutoff)
     
     if args.player_only:
         builder.build_player_features()
@@ -100,6 +100,8 @@ def main():
     features_parser.add_argument('--player-only', action='store_true', help='Only build player features')
     features_parser.add_argument('--matchup-only', action='store_true', help='Only build matchup features')
     features_parser.add_argument('--tournament-only', action='store_true', help='Only build tournament features')
+    features_parser.add_argument('--rank-cutoff', type=int, default=None,
+                                 help='Only generate player features for players ranked better than or equal to this value')
     
     # Parse arguments
     args = parser.parse_args()

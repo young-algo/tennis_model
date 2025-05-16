@@ -68,6 +68,7 @@ Optional arguments:
 - `--player-only`: Only generate player features
 - `--matchup-only`: Only generate matchup features
 - `--tournament-only`: Only generate tournament features
+- `--rank-cutoff <INT>`: Only generate player features for players ranked better than or equal to this value
 
 ### Database Migrations
 

@@ -33,10 +33,21 @@ DB_PATH = PROCESSED_DATA_DIR / 'tennis.db'
 
 class FeatureBuilder:
     """Class to build features from tennis match data"""
-    
-    def __init__(self, db_path=DB_PATH):
-        """Initialize the feature builder"""
+
+    def __init__(self, db_path=DB_PATH, rank_cutoff=None):
+        """Initialize the feature builder
+
+        Parameters
+        ----------
+        db_path : str or Path
+            Path to the SQLite database file.
+        rank_cutoff : int or None
+            Optional ranking cutoff. If provided, player features will only be
+            generated for players whose most recent ranking is better than or
+            equal to this value.
+        """
         self.db_path = db_path
+        self.rank_cutoff = rank_cutoff
         self.conn = None
         self.matches_df = None
         self.players_df = None
@@ -89,9 +100,26 @@ class FeatureBuilder:
         # Initialize features DataFrame
         player_features = []
         
-        # Get unique players
+        # Get unique players from match data
         unique_players = set(self.matches_df['winner_id']).union(set(self.matches_df['loser_id']))
-        logger.info(f"Building features for {len(unique_players)} players")
+
+        # Apply ranking cutoff if provided
+        if self.rank_cutoff is not None:
+            latest_rankings = (
+                self.rankings_df.sort_values('ranking_date')
+                .dropna(subset=['ranking'])
+                .groupby('player_id')
+                .tail(1)
+            )
+            eligible_players = set(
+                latest_rankings[latest_rankings['ranking'] <= self.rank_cutoff]['player_id']
+            )
+            unique_players = unique_players.intersection(eligible_players)
+            logger.info(
+                f"Applying rank cutoff {self.rank_cutoff}: building features for {len(unique_players)} players"
+            )
+        else:
+            logger.info(f"Building features for {len(unique_players)} players")
         
         for player_id in unique_players:
             # Basic player information
@@ -371,17 +399,17 @@ class FeatureBuilder:
         output_file = FEATURES_DIR / 'tournament_features.parquet'
         tournament_features_df.to_parquet(output_file, index=False)
         logger.info(f"Saved tournament features to {output_file}")
-        
+
         return tournament_features_df
-    
+
     def build_all_features(self):
         """Build all feature sets"""
         self.load_data()
-        
+
         player_features = self.build_player_features()
         matchup_features = self.build_matchup_features()
         tournament_features = self.build_tournament_features()
-        
+
         return {
             'player_features': player_features,
             'matchup_features': matchup_features,
@@ -396,13 +424,18 @@ def main():
     parser.add_argument('--player-only', action='store_true', help='Only build player features')
     parser.add_argument('--matchup-only', action='store_true', help='Only build matchup features')
     parser.add_argument('--tournament-only', action='store_true', help='Only build tournament features')
-    
+    parser.add_argument('--rank-cutoff', type=int, default=None,
+                        help='Only generate player features for players with a ranking better than or equal to this value')
+
     args = parser.parse_args()
-    
+
     # Set up feature builder
-    builder = FeatureBuilder(db_path=args.db_path if args.db_path else DB_PATH)
+    builder = FeatureBuilder(
+        db_path=args.db_path if args.db_path else DB_PATH,
+        rank_cutoff=args.rank_cutoff,
+    )
     builder.load_data()
-    
+
     # Build features based on arguments
     if args.player_only:
         builder.build_player_features()
@@ -413,7 +446,7 @@ def main():
     else:
         # Build all features by default
         builder.build_all_features()
-    
+
     logger.info("Feature building completed successfully")
 
 
