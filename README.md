@@ -70,6 +70,19 @@ Optional arguments:
 - `--tournament-only`: Only generate tournament features
 - `--rank-cutoff <INT>`: Only generate player features for players ranked better than or equal to this value
 
+### Head-to-Head Prediction
+
+Train a logistic regression model and generate matchup predictions:
+
+```bash
+python -m src.models.head_to_head_predictor train
+
+# Predict from a CSV of matchups with columns: player1_id,player2_id
+python -m src.models.head_to_head_predictor predict matchups.csv
+```
+
+The prediction command will append a `player1_win_prob` column to the input CSV.
+
 ### Database Migrations
 
 Manage database schema:
