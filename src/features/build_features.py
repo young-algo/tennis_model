@@ -11,8 +11,13 @@ import sqlite3
 import pandas as pd
 import numpy as np
 import logging
+import time
 from pathlib import Path
 import argparse
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+from tqdm import tqdm
+import multiprocessing
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +39,7 @@ DB_PATH = PROCESSED_DATA_DIR / 'tennis.db'
 class FeatureBuilder:
     """Class to build features from tennis match data"""
 
-    def __init__(self, db_path=DB_PATH, rank_cutoff=None):
+    def __init__(self, db_path=DB_PATH, rank_cutoff=None, years_limit=None, incremental=False, since_date=None):
         """Initialize the feature builder
 
         Parameters
@@ -45,26 +50,80 @@ class FeatureBuilder:
             Optional ranking cutoff. If provided, player features will only be
             generated for players whose most recent ranking is better than or
             equal to this value.
+        years_limit : int or None
+            Optional limit for matchup features to only include matches from the last
+            specified number of years. If None, all matches are included.
+        incremental : bool
+            Whether to perform an incremental update of features or rebuild from scratch.
+        since_date : str or None
+            If provided with incremental=True, only process matches since this date.
+            Format: 'YYYY-MM-DD'
         """
         self.db_path = db_path
         self.rank_cutoff = rank_cutoff
+        self.years_limit = years_limit
+        self.incremental = incremental
+        self.since_date = pd.Timestamp(since_date) if since_date else None
         self.conn = None
         self.matches_df = None
         self.players_df = None
         self.rankings_df = None
         self.tournaments_df = None
         
+        # Existing feature data (for incremental updates)
+        self.existing_player_features = None
+        self.existing_matchup_features = None
+        self.existing_tournament_features = None
+        
         # Ensure output directory exists
         FEATURES_DIR.mkdir(parents=True, exist_ok=True)
+    
+    def _load_existing_features(self):
+        """Load existing feature data for incremental updates"""
+        logger.info("Loading existing feature data for incremental update")
+        
+        # Player features
+        player_features_path = FEATURES_DIR / 'player_features.parquet'
+        if player_features_path.exists():
+            self.existing_player_features = pd.read_parquet(player_features_path)
+            logger.info(f"Loaded {len(self.existing_player_features)} existing player features")
+        else:
+            self.existing_player_features = pd.DataFrame()
+            logger.warning("No existing player features found, will create new")
+        
+        # Matchup features
+        matchup_features_path = FEATURES_DIR / 'matchup_features.parquet'
+        if matchup_features_path.exists():
+            self.existing_matchup_features = pd.read_parquet(matchup_features_path)
+            logger.info(f"Loaded {len(self.existing_matchup_features)} existing matchup features")
+        else:
+            self.existing_matchup_features = pd.DataFrame()
+            logger.warning("No existing matchup features found, will create new")
+        
+        # Tournament features
+        tournament_features_path = FEATURES_DIR / 'tournament_features.parquet'
+        if tournament_features_path.exists():
+            self.existing_tournament_features = pd.read_parquet(tournament_features_path)
+            logger.info(f"Loaded {len(self.existing_tournament_features)} existing tournament features")
+        else:
+            self.existing_tournament_features = pd.DataFrame()
+            logger.warning("No existing tournament features found, will create new")
     
     def load_data(self):
         """Load data from SQLite database"""
         logger.info("Loading data from database...")
         self.conn = sqlite3.connect(self.db_path)
         
+        # SQL query for matches - filter by date if incremental
+        if self.incremental and self.since_date:
+            match_query = f"SELECT * FROM matches WHERE match_date >= '{self.since_date.strftime('%Y-%m-%d')}'"
+            logger.info(f"Incremental update: Loading matches since {self.since_date.strftime('%Y-%m-%d')}")
+        else:
+            match_query = "SELECT * FROM matches"
+        
         # Load matches
         self.matches_df = pd.read_sql_query(
-            "SELECT * FROM matches", 
+            match_query, 
             self.conn, 
             parse_dates=['match_date']
         )
@@ -79,8 +138,14 @@ class FeatureBuilder:
         logger.info(f"Loaded {len(self.players_df)} players")
         
         # Load rankings
+        ranking_query = f"SELECT * FROM rankings"
+        if self.incremental and self.since_date:
+            # For rankings, get a bit more history to ensure we have context
+            history_date = self.since_date - pd.DateOffset(months=3)
+            ranking_query += f" WHERE ranking_date >= '{history_date.strftime('%Y-%m-%d')}'"
+            
         self.rankings_df = pd.read_sql_query(
-            "SELECT * FROM rankings", 
+            ranking_query, 
             self.conn, 
             parse_dates=['ranking_date']
         )
@@ -92,6 +157,10 @@ class FeatureBuilder:
             self.conn
         )
         logger.info(f"Loaded {len(self.tournaments_df)} tournaments")
+        
+        # If incremental update, load existing feature data
+        if self.incremental:
+            self._load_existing_features()
     
     def build_player_features(self):
         """Build player-level features"""
@@ -102,6 +171,25 @@ class FeatureBuilder:
         
         # Get unique players from match data
         unique_players = set(self.matches_df['winner_id']).union(set(self.matches_df['loser_id']))
+        
+        # For incremental updates, we only need to process players in recent matches
+        # plus any players whose existing features would be affected
+        if self.incremental and not self.existing_player_features.empty:
+            logger.info(f"Incremental update: Starting with {len(unique_players)} players from recent matches")
+            
+            # Also add players from existing features whose stats need updating
+            # (based on new matches in the dataset)
+            known_player_ids = set(self.existing_player_features['player_id'])
+            
+            # Keep track of players we'll update
+            players_to_update = unique_players.copy()
+            # Players to keep unchanged
+            players_to_keep = known_player_ids - unique_players
+            
+            logger.info(f"Incremental update: Updating {len(players_to_update)} players, keeping {len(players_to_keep)} unchanged")
+        else:
+            # When not doing incremental updates, players_to_keep is empty
+            players_to_keep = set()
 
         # Apply ranking cutoff if provided
         if self.rank_cutoff is not None:
@@ -115,6 +203,11 @@ class FeatureBuilder:
                 latest_rankings[latest_rankings['ranking'] <= self.rank_cutoff]['player_id']
             )
             unique_players = unique_players.intersection(eligible_players)
+            
+            # For incremental updates, also filter players_to_keep by ranking
+            if self.incremental and not self.existing_player_features.empty:
+                players_to_keep = players_to_keep.intersection(eligible_players)
+                
             logger.info(
                 f"Applying rank cutoff {self.rank_cutoff}: building features for {len(unique_players)} players"
             )
@@ -227,113 +320,243 @@ class FeatureBuilder:
         # Convert to DataFrame
         player_features_df = pd.DataFrame(player_features)
         
+        # For incremental updates, merge with existing features for players that aren't being updated
+        if self.incremental and not self.existing_player_features.empty and players_to_keep:
+            logger.info("Merging new player features with existing features")
+            
+            # Filter existing features to only include players we want to keep
+            keep_features = self.existing_player_features[
+                self.existing_player_features['player_id'].isin(players_to_keep)
+            ]
+            
+            # Combine the new and existing features
+            if not keep_features.empty:
+                player_features_df = pd.concat([player_features_df, keep_features])
+                logger.info(f"Added {len(keep_features)} players from existing features")
+        
         # Save to parquet
         output_file = FEATURES_DIR / 'player_features.parquet'
         player_features_df.to_parquet(output_file, index=False)
-        logger.info(f"Saved player features to {output_file}")
+        logger.info(f"Saved {len(player_features_df)} player features to {output_file}")
         
         return player_features_df
     
+    @staticmethod
+    def _process_matchup(player_pair, tour_matches, players_df):
+        """Process a single matchup (helper function for parallelization)"""
+        p1, p2 = player_pair
+        
+        # Get matches between these players
+        h2h_matches = tour_matches[
+            ((tour_matches['winner_id'] == p1) & (tour_matches['loser_id'] == p2)) |
+            ((tour_matches['winner_id'] == p2) & (tour_matches['loser_id'] == p1))
+        ].copy()  # Create a copy to avoid any shared memory issues
+        
+        total_matches = len(h2h_matches)
+        if total_matches < 2:  # Only include matchups with at least 2 matches
+            return None
+        
+        # Count wins for each player
+        p1_wins = len(h2h_matches[h2h_matches['winner_id'] == p1])
+        p2_wins = len(h2h_matches[h2h_matches['winner_id'] == p2])
+        
+        matchup_data = {
+            'player1_id': p1,
+            'player2_id': p2,
+            'total_matches': total_matches,
+            'player1_wins': p1_wins,
+            'player2_wins': p2_wins,
+            'player1_win_rate': p1_wins / total_matches,
+            'player2_win_rate': p2_wins / total_matches,
+            'tour': tour_matches['tour'].iloc[0]
+        }
+        
+        # Surface-specific H2H
+        for surface in ['Hard', 'Clay', 'Grass', 'Carpet']:
+            surface_matches = h2h_matches[h2h_matches['surface'] == surface]
+            surface_total = len(surface_matches)
+            
+            if surface_total > 0:
+                surface_p1_wins = len(surface_matches[surface_matches['winner_id'] == p1])
+                surface_p2_wins = len(surface_matches[surface_matches['winner_id'] == p2])
+                
+                matchup_data[f'{surface.lower()}_matches'] = surface_total
+                matchup_data[f'{surface.lower()}_player1_wins'] = surface_p1_wins
+                matchup_data[f'{surface.lower()}_player2_wins'] = surface_p2_wins
+                matchup_data[f'{surface.lower()}_player1_win_rate'] = surface_p1_wins / surface_total
+                matchup_data[f'{surface.lower()}_player2_win_rate'] = surface_p2_wins / surface_total
+        
+        # Recent matchup results (last 3 matches)
+        recent_matches = h2h_matches.sort_values('match_date', ascending=False).head(3)
+        if len(recent_matches) > 0:
+            recent_p1_wins = len(recent_matches[recent_matches['winner_id'] == p1])
+            recent_p2_wins = len(recent_matches[recent_matches['winner_id'] == p2])
+            
+            matchup_data['recent_matches'] = len(recent_matches)
+            matchup_data['recent_player1_win_rate'] = recent_p1_wins / len(recent_matches)
+            matchup_data['recent_player2_win_rate'] = recent_p2_wins / len(recent_matches)
+        
+        # Physical matchup
+        p1_info = players_df[players_df['player_id'] == p1]
+        p2_info = players_df[players_df['player_id'] == p2]
+        
+        if not p1_info.empty and not p2_info.empty:
+            # Height difference
+            p1_height = p1_info['height'].iloc[0]
+            p2_height = p2_info['height'].iloc[0]
+            
+            if not pd.isna(p1_height) and not pd.isna(p2_height):
+                matchup_data['height_diff'] = p1_height - p2_height
+            
+            # Dominant hand matchup
+            p1_hand = p1_info['hand'].iloc[0]
+            p2_hand = p2_info['hand'].iloc[0]
+            
+            if not pd.isna(p1_hand) and not pd.isna(p2_hand):
+                matchup_data['dominant_hand_matchup'] = f"{p1_hand}v{p2_hand}"
+        
+        return matchup_data
+
     def build_matchup_features(self):
         """Build matchup-level features between pairs of players"""
         logger.info("Building matchup features...")
+        start_time = time.time()
+        checkpoint_interval = 1000  # Save progress every 1000 pairs
         
         # Get unique combinations of players who've faced each other
         matchups = []
+        checkpoint_path = FEATURES_DIR / 'matchup_features_checkpoint.parquet'
+        
+        # Resume from checkpoint if it exists
+        if checkpoint_path.exists():
+            logger.info(f"Found checkpoint file at {checkpoint_path}. Resuming from checkpoint...")
+            checkpoint_df = pd.read_parquet(checkpoint_path)
+            matchups = checkpoint_df.to_dict('records')
+            # Create a set of already processed pairs to avoid duplicates
+            processed_pairs = {(row['player1_id'], row['player2_id'], row['tour']) for row in matchups}
+            logger.info(f"Loaded {len(matchups)} matchups from checkpoint")
+        else:
+            processed_pairs = set()
+            
+        # For incremental updates, track matchups to be updated
+        matchups_to_update = set()
+        if self.incremental and not self.existing_matchup_features.empty:
+            logger.info("Incremental update: Determining which matchups need updating")
+            
+            # Identify player pairs in new matches
+            for tour in ['ATP', 'WTA']:
+                tour_matches = self.matches_df[self.matches_df['tour'] == tour]
+                
+                # Get player pairs from new matches
+                for _, match in tour_matches.iterrows():
+                    w_id, l_id = match['winner_id'], match['loser_id']
+                    p1, p2 = (w_id, l_id) if w_id < l_id else (l_id, w_id)
+                    matchups_to_update.add((p1, p2, tour))
+            
+            logger.info(f"Incremental update: {len(matchups_to_update)} matchups to update")
+        
+        # Determine number of workers (leave 1 core free for system)
+        num_workers = max(1, multiprocessing.cpu_count() - 1)
+        logger.info(f"Using {num_workers} workers for parallel processing")
         
         for tour in ['ATP', 'WTA']:
             tour_matches = self.matches_df[self.matches_df['tour'] == tour]
             
+            # Filter matches by date if years_limit is specified
+            if self.years_limit is not None:
+                current_date = pd.Timestamp.now()
+                cutoff_date = current_date - pd.DateOffset(years=self.years_limit)
+                tour_matches = tour_matches[tour_matches['match_date'] >= cutoff_date]
+                logger.info(f"Filtered to {len(tour_matches)} {tour} matches from the last {self.years_limit} years")
+            
             # Create a unique set of player pairs who have played against each other
             player_pairs = set()
-            for _, match in tour_matches.iterrows():
-                p1, p2 = match['winner_id'], match['loser_id']
-                if p1 > p2:  # Ensure consistent ordering
-                    p1, p2 = p2, p1
+            
+            # More efficient way to extract player pairs
+            winners = tour_matches[['winner_id', 'loser_id']].values
+            for w_id, l_id in winners:
+                p1, p2 = (w_id, l_id) if w_id < l_id else (l_id, w_id)
                 player_pairs.add((p1, p2))
+            
+            # Filter out already processed pairs
+            player_pairs = [pair for pair in player_pairs if (pair[0], pair[1], tour) not in processed_pairs]
             
             logger.info(f"Building features for {len(player_pairs)} {tour} matchups")
             
-            for p1, p2 in player_pairs:
-                # Get matches between these players
-                h2h_matches = tour_matches[
-                    ((tour_matches['winner_id'] == p1) & (tour_matches['loser_id'] == p2)) |
-                    ((tour_matches['winner_id'] == p2) & (tour_matches['loser_id'] == p1))
-                ]
+            # Use process pool to parallelize computation
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Create a partial function with fixed arguments
+                process_func = partial(self._process_matchup, 
+                                      tour_matches=tour_matches, 
+                                      players_df=self.players_df)
                 
-                total_matches = len(h2h_matches)
-                if total_matches < 2:  # Only include matchups with at least 2 matches
-                    continue
-                
-                # Count wins for each player
-                p1_wins = len(h2h_matches[h2h_matches['winner_id'] == p1])
-                p2_wins = len(h2h_matches[h2h_matches['winner_id'] == p2])
-                
-                matchup_data = {
-                    'player1_id': p1,
-                    'player2_id': p2,
-                    'total_matches': total_matches,
-                    'player1_wins': p1_wins,
-                    'player2_wins': p2_wins,
-                    'player1_win_rate': p1_wins / total_matches,
-                    'player2_win_rate': p2_wins / total_matches,
-                    'tour': tour
-                }
-                
-                # Surface-specific H2H
-                for surface in ['Hard', 'Clay', 'Grass', 'Carpet']:
-                    surface_matches = h2h_matches[h2h_matches['surface'] == surface]
-                    surface_total = len(surface_matches)
+                # Process in batches with progress monitoring
+                batch_size = 5000  # Adjust based on available memory
+                for i in range(0, len(player_pairs), batch_size):
+                    batch = player_pairs[i:i+batch_size]
+                    logger.info(f"Processing batch {i//batch_size + 1}/{len(player_pairs)//batch_size + 1} ({len(batch)} pairs)")
                     
-                    if surface_total > 0:
-                        surface_p1_wins = len(surface_matches[surface_matches['winner_id'] == p1])
-                        surface_p2_wins = len(surface_matches[surface_matches['winner_id'] == p2])
-                        
-                        matchup_data[f'{surface.lower()}_matches'] = surface_total
-                        matchup_data[f'{surface.lower()}_player1_wins'] = surface_p1_wins
-                        matchup_data[f'{surface.lower()}_player2_wins'] = surface_p2_wins
-                        matchup_data[f'{surface.lower()}_player1_win_rate'] = surface_p1_wins / surface_total
-                        matchup_data[f'{surface.lower()}_player2_win_rate'] = surface_p2_wins / surface_total
-                
-                # Recent matchup results (last 3 matches)
-                recent_matches = h2h_matches.sort_values('match_date', ascending=False).head(3)
-                if len(recent_matches) > 0:
-                    recent_p1_wins = len(recent_matches[recent_matches['winner_id'] == p1])
-                    recent_p2_wins = len(recent_matches[recent_matches['winner_id'] == p2])
+                    # Execute in parallel with progress bar
+                    results = list(tqdm(
+                        executor.map(process_func, batch),
+                        total=len(batch),
+                        desc=f"{tour} Matchups"
+                    ))
                     
-                    matchup_data['recent_matches'] = len(recent_matches)
-                    matchup_data['recent_player1_win_rate'] = recent_p1_wins / len(recent_matches)
-                    matchup_data['recent_player2_win_rate'] = recent_p2_wins / len(recent_matches)
-                
-                # Physical matchup
-                p1_info = self.players_df[self.players_df['player_id'] == p1]
-                p2_info = self.players_df[self.players_df['player_id'] == p2]
-                
-                if not p1_info.empty and not p2_info.empty:
-                    # Height difference
-                    p1_height = p1_info['height'].iloc[0]
-                    p2_height = p2_info['height'].iloc[0]
+                    # Filter out None results and append to matchups
+                    batch_results = [r for r in results if r is not None]
+                    matchups.extend(batch_results)
                     
-                    if not pd.isna(p1_height) and not pd.isna(p2_height):
-                        matchup_data['height_diff'] = p1_height - p2_height
-                    
-                    # Dominant hand matchup
-                    p1_hand = p1_info['hand'].iloc[0]
-                    p2_hand = p2_info['hand'].iloc[0]
-                    
-                    if not pd.isna(p1_hand) and not pd.isna(p2_hand):
-                        matchup_data['dominant_hand_matchup'] = f"{p1_hand}v{p2_hand}"
-                
-                matchups.append(matchup_data)
+                    # Save checkpoint periodically
+                    if len(matchups) % checkpoint_interval == 0:
+                        checkpoint_df = pd.DataFrame(matchups)
+                        checkpoint_df.to_parquet(checkpoint_path, index=False)
+                        elapsed = time.time() - start_time
+                        logger.info(f"Checkpoint saved: {len(matchups)} matchups processed in {elapsed:.2f}s")
         
         # Convert to DataFrame
         matchup_features_df = pd.DataFrame(matchups)
+        
+        # For incremental updates, merge with existing features
+        if self.incremental and not self.existing_matchup_features.empty:
+            # Create identifier for each matchup
+            if not matchup_features_df.empty:
+                matchup_features_df['matchup_id'] = matchup_features_df.apply(
+                    lambda x: f"{x['player1_id']}_{x['player2_id']}_{x['tour']}", axis=1)
+            
+            # Add same identifier to existing features
+            self.existing_matchup_features['matchup_id'] = self.existing_matchup_features.apply(
+                lambda x: f"{x['player1_id']}_{x['player2_id']}_{x['tour']}", axis=1)
+            
+            # Get matchups that were updated
+            updated_ids = set(matchup_features_df['matchup_id']) if not matchup_features_df.empty else set()
+            
+            # Filter out matchups that were updated
+            keep_features = self.existing_matchup_features[
+                ~self.existing_matchup_features['matchup_id'].isin(updated_ids)
+            ].drop(columns=['matchup_id'])
+            
+            logger.info(f"Keeping {len(keep_features)} unchanged matchups from existing features")
+            
+            # Combine the new and existing features
+            if not matchup_features_df.empty:
+                matchup_features_df = matchup_features_df.drop(columns=['matchup_id'])
+                matchup_features_df = pd.concat([matchup_features_df, keep_features])
+                logger.info(f"Combined features: {len(matchup_features_df)} total matchups")
+            else:
+                matchup_features_df = keep_features
+                logger.info(f"Using only existing features: {len(matchup_features_df)} matchups")
+        
+        # Remove checkpoint file
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
         
         # Save to parquet if we have data
         if not matchup_features_df.empty:
             output_file = FEATURES_DIR / 'matchup_features.parquet'
             matchup_features_df.to_parquet(output_file, index=False)
-            logger.info(f"Saved matchup features to {output_file}")
+            elapsed = time.time() - start_time
+            logger.info(f"Saved {len(matchup_features_df)} matchup features to {output_file} in {elapsed:.2f}s")
         else:
             logger.warning("No matchup features generated")
         
@@ -345,12 +568,23 @@ class FeatureBuilder:
         
         tournament_features = []
         
+        # For incremental updates, identify which tournaments need updating
+        tournaments_to_update = set()
+        if self.incremental and not self.existing_tournament_features.empty:
+            # Get tournaments from new matches
+            tournaments_to_update = set(self.matches_df['tournament_id'].dropna())
+            logger.info(f"Incremental update: {len(tournaments_to_update)} tournaments to update")
+        
         for tour in ['ATP', 'WTA']:
             # Get unique tournaments
             tournaments = self.tournaments_df[self.tournaments_df['tour'] == tour]
             
             for _, tournament in tournaments.iterrows():
                 tournament_id = tournament['tournament_id']
+                
+                # In incremental mode, skip tournaments that aren't in new matches
+                if self.incremental and tournament_id not in tournaments_to_update:
+                    continue
                 
                 # Get all matches for this tournament
                 tournament_matches = self.matches_df[self.matches_df['tournament_id'] == tournament_id]
@@ -395,10 +629,41 @@ class FeatureBuilder:
         # Convert to DataFrame
         tournament_features_df = pd.DataFrame(tournament_features)
         
+        # For incremental updates, merge with existing features
+        if self.incremental and not self.existing_tournament_features.empty:
+            # Add identifier column
+            if not tournament_features_df.empty:
+                # Create unique identifier for each tournament
+                tournament_features_df['tournament_key'] = tournament_features_df.apply(
+                    lambda x: f"{x['tournament_id']}_{x['tour']}", axis=1)
+            
+            # Add same identifier to existing features
+            self.existing_tournament_features['tournament_key'] = self.existing_tournament_features.apply(
+                lambda x: f"{x['tournament_id']}_{x['tour']}", axis=1)
+            
+            # Get tournaments that were updated
+            updated_ids = set(tournament_features_df['tournament_key']) if not tournament_features_df.empty else set()
+            
+            # Filter out tournaments that were updated
+            keep_features = self.existing_tournament_features[
+                ~self.existing_tournament_features['tournament_key'].isin(updated_ids)
+            ].drop(columns=['tournament_key'])
+            
+            logger.info(f"Keeping {len(keep_features)} unchanged tournaments from existing features")
+            
+            # Combine the new and existing features
+            if not tournament_features_df.empty:
+                tournament_features_df = tournament_features_df.drop(columns=['tournament_key'])
+                tournament_features_df = pd.concat([tournament_features_df, keep_features])
+                logger.info(f"Combined features: {len(tournament_features_df)} total tournaments")
+            else:
+                tournament_features_df = keep_features
+                logger.info(f"Using only existing features: {len(tournament_features_df)} tournaments")
+        
         # Save to parquet
         output_file = FEATURES_DIR / 'tournament_features.parquet'
         tournament_features_df.to_parquet(output_file, index=False)
-        logger.info(f"Saved tournament features to {output_file}")
+        logger.info(f"Saved {len(tournament_features_df)} tournament features to {output_file}")
 
         return tournament_features_df
 
@@ -407,8 +672,23 @@ class FeatureBuilder:
         self.load_data()
 
         player_features = self.build_player_features()
+        
+        # Close connection before multiprocessing to avoid pickling errors
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+            
         matchup_features = self.build_matchup_features()
+        
+        # Reopen connection for tournament features if needed
+        if self.conn is None:
+            self.conn = sqlite3.connect(self.db_path)
+            
         tournament_features = self.build_tournament_features()
+        
+        # Close connection when done
+        if self.conn:
+            self.conn.close()
 
         return {
             'player_features': player_features,
@@ -426,6 +706,12 @@ def main():
     parser.add_argument('--tournament-only', action='store_true', help='Only build tournament features')
     parser.add_argument('--rank-cutoff', type=int, default=None,
                         help='Only generate player features for players with a ranking better than or equal to this value')
+    parser.add_argument('--years-limit', type=int, default=3,
+                        help='Limit matchup features to only include matches from the last N years (default: 3)')
+    parser.add_argument('--incremental', action='store_true', 
+                        help='Incrementally update features with new data instead of rebuilding everything')
+    parser.add_argument('--since-date', type=str, default=None,
+                        help='Only process matches since this date (format: YYYY-MM-DD). Used with --incremental')
 
     args = parser.parse_args()
 
@@ -433,16 +719,29 @@ def main():
     builder = FeatureBuilder(
         db_path=args.db_path if args.db_path else DB_PATH,
         rank_cutoff=args.rank_cutoff,
+        years_limit=args.years_limit,
+        incremental=args.incremental,
+        since_date=args.since_date,
     )
     builder.load_data()
 
     # Build features based on arguments
     if args.player_only:
         builder.build_player_features()
+        # Close connection when done
+        if builder.conn:
+            builder.conn.close()
     elif args.matchup_only:
+        # Close connection before multiprocessing to avoid pickling errors
+        if builder.conn:
+            builder.conn.close()
+            builder.conn = None
         builder.build_matchup_features()
     elif args.tournament_only:
         builder.build_tournament_features()
+        # Close connection when done
+        if builder.conn:
+            builder.conn.close()
     else:
         # Build all features by default
         builder.build_all_features()
