@@ -566,6 +566,7 @@ class FeatureBuilder:
         """Build tournament-level features"""
         logger.info("Building tournament features...")
         
+        current_year = pd.Timestamp.now().year
         tournament_features = []
         
         # For incremental updates, identify which tournaments need updating
@@ -591,6 +592,13 @@ class FeatureBuilder:
                 
                 if len(tournament_matches) == 0:
                     continue  # Skip tournaments with no matches
+
+                # Calculate last_year for the tournament
+                last_year = tournament_matches['match_date'].dt.year.max()
+
+                # Skip tournaments not active in the last 4 years
+                if current_year - last_year > 4:
+                    continue
                 
                 # Basic statistics
                 tournament_data = {
@@ -607,7 +615,7 @@ class FeatureBuilder:
                 years = tournament_matches['match_date'].dt.year.unique()
                 tournament_data['years_active'] = len(years)
                 tournament_data['first_year'] = min(years)
-                tournament_data['last_year'] = max(years)
+                tournament_data['last_year'] = last_year # Use the calculated last_year
                 
                 # Player information
                 unique_players = set(tournament_matches['winner_id']).union(set(tournament_matches['loser_id']))
