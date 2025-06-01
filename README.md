@@ -83,6 +83,22 @@ python -m src.models.head_to_head_predictor predict matchups.csv
 
 The prediction command will append a `player1_win_prob` column to the input CSV.
 
+### Fetch Upcoming Draw
+
+Download the official draw for the next WTA tournament and output a CSV of
+matchups ready for prediction. The script uses the WTA public API and
+requires an internet connection:
+
+```bash
+python src/data/fetch_upcoming_draw.py --output upcoming_draw.csv
+```
+
+The resulting file can be passed directly to `HeadToHeadPredictor`:
+
+```bash
+python -m src.models.head_to_head_predictor predict upcoming_draw.csv
+```
+
 ### Database Migrations
 
 Manage database schema:
@@ -116,6 +132,7 @@ tennis_model/
 │   ├── data/                  # Data processing modules
 │   │   ├── ingest_sackmann_data.py  # Data ingestion script
 │   │   ├── db_migrations.py   # Database migration system
+│   │   ├── fetch_upcoming_draw.py  # Download upcoming WTA draw
 │   │   └── migrations/        # Migration files
 │   ├── features/              # Feature engineering
 │   │   └── build_features.py  # Feature building script
